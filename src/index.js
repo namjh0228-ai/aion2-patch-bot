@@ -1,5 +1,5 @@
 import express from "express";
-import * as cheerio from "cheerio";
+import { chromium } from "playwright";
 import {
   Client,
   EmbedBuilder,
@@ -9,7 +9,6 @@ import {
 
 const UPDATE_LIST_URL =
   "https://aion2.plaync.com/ko-kr/board/update/list";
-const BASE_URL = "https://aion2.plaync.com";
 
 const token = process.env.DISCORD_TOKEN;
 const channelId = process.env.DISCORD_CHANNEL_ID;
@@ -35,283 +34,155 @@ app.listen(process.env.PORT || 3000, () => {
   console.log("Health server started.");
 });
 
-const requestHeaders = {
-  "user-agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-  accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif," +
-    "image/webp,*/*;q=0.8",
-  "accept-language": "ko-KR,ko;q=0.9,en;q=0.8",
-  "cache-control": "no-cache",
-  pragma: "no-cache",
-};
-
 function normalizeUrl(value) {
-  if (!value || typeof value !== "string") return null;
-
-  const cleaned = value
-    .replaceAll("\\/", "/")
-    .replaceAll("\\u0026", "&")
-    .replaceAll("&amp;", "&")
-    .trim();
-
+  if (!value) return null;
   try {
-    return new URL(cleaned, BASE_URL).toString();
+    return new URL(value, UPDATE_LIST_URL).toString();
   } catch {
     return null;
   }
 }
 
 function cleanText(value) {
-  if (!value || typeof value !== "string") return "";
-  return cheerio
-    .load(value)
-    .text()
+  return String(value ?? "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-async function fetchHtml(url) {
-  const response = await fetch(url, {
-    headers: requestHeaders,
-    redirect: "follow",
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${url}`);
-  }
-
-  return response.text();
-}
-
-function addCandidate(map, title, url, published = null) {
-  const normalizedUrl = normalizeUrl(url);
-  const cleanedTitle = cleanText(title);
-
-  if (
-    !normalizedUrl ||
-    !normalizedUrl.includes("/board/update/view") ||
-    !normalizedUrl.includes("articleId=") ||
-    cleanedTitle.length < 4
-  ) {
-    return;
-  }
-
-  map.set(normalizedUrl, {
-    title: cleanedTitle.slice(0, 250),
-    url: normalizedUrl,
-    published,
+async function launchBrowser() {
+  return chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+    ],
   });
 }
 
-function walkJson(value, candidates) {
-  if (!value) return;
+async function getUpdatePosts() {
+  const browser = await launchBrowser();
 
-  if (Array.isArray(value)) {
-    for (const item of value) walkJson(item, candidates);
-    return;
-  }
+  try {
+    const page = await browser.newPage({
+      locale: "ko-KR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+      viewport: { width: 1440, height: 1200 },
+    });
 
-  if (typeof value !== "object") return;
+    await page.goto(UPDATE_LIST_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
+    });
 
-  const articleId =
-    value.articleId ??
-    value.article_id ??
-    value.articleNo ??
-    value.article_no ??
-    value.id;
+    // 게시판 데이터가 자바스크립트로 불러와질 시간을 줍니다.
+    await page
+      .waitForSelector('a[href*="/board/update/view"]', { timeout: 30000 })
+      .catch(() => null);
 
-  const title =
-    value.title ??
-    value.subject ??
-    value.articleTitle ??
-    value.article_title ??
-    value.name;
+    await page.waitForTimeout(3000);
 
-  const explicitUrl =
-    value.url ??
-    value.link ??
-    value.href ??
-    value.articleUrl ??
-    value.article_url;
+    const posts = await page.evaluate(() => {
+      const results = [];
+      const seen = new Set();
 
-  const published =
-    value.publishDate ??
-    value.publishedAt ??
-    value.createDate ??
-    value.createdAt ??
-    value.registerDate ??
-    null;
+      for (const link of document.querySelectorAll(
+        'a[href*="/board/update/view"]',
+      )) {
+        const href = link.href;
+        const title =
+          link.getAttribute("title") ||
+          link.querySelector("[title]")?.getAttribute("title") ||
+          link.textContent ||
+          "";
 
-  if (explicitUrl && title) {
-    addCandidate(candidates, title, explicitUrl, published);
-  }
+        const cleanedTitle = title.replace(/\s+/g, " ").trim();
 
-  if (articleId && title) {
-    const id = String(articleId);
-    if (/^[a-f0-9]{16,}$/i.test(id)) {
-      addCandidate(
-        candidates,
-        title,
-        `/ko-kr/board/update/view?articleId=${id}`,
-        published,
-      );
-    }
-  }
+        if (
+          !href ||
+          !href.includes("articleId=") ||
+          cleanedTitle.length < 4 ||
+          seen.has(href)
+        ) {
+          continue;
+        }
 
-  for (const nested of Object.values(value)) {
-    walkJson(nested, candidates);
-  }
-}
-
-function extractFromJsonScripts($, candidates) {
-  $("script").each((_index, element) => {
-    const raw = $(element).html()?.trim();
-    if (!raw) return;
-
-    // application/json, __NEXT_DATA__, Apollo/React 상태 JSON 등을 처리합니다.
-    const attempts = [raw];
-
-    // 일부 사이트는 JSON을 문자열 안에 한 번 더 이스케이프합니다.
-    attempts.push(
-      raw
-        .replaceAll("\\/", "/")
-        .replaceAll("\\u0026", "&")
-        .replaceAll('\\"', '"'),
-    );
-
-    for (const text of attempts) {
-      try {
-        walkJson(JSON.parse(text), candidates);
-      } catch {
-        // 일반 JavaScript 스크립트는 JSON.parse가 실패하는 것이 정상입니다.
+        seen.add(href);
+        results.push({
+          title: cleanedTitle.slice(0, 250),
+          url: href,
+        });
       }
-    }
-  });
-}
 
-function extractFromRawHtml(html, candidates) {
-  const decoded = html
-    .replaceAll("\\/", "/")
-    .replaceAll("\\u0026", "&")
-    .replaceAll("&amp;", "&");
+      return results;
+    });
 
-  // 링크 주변의 텍스트를 제목으로 사용합니다.
-  const linkRegex =
-    /(?:https:\/\/aion2\.plaync\.com)?(\/ko-kr\/board\/update\/view\?articleId=([a-f0-9]+))/gi;
-
-  for (const match of decoded.matchAll(linkRegex)) {
-    const url = match[1];
-    const position = match.index ?? 0;
-    const around = decoded.slice(
-      Math.max(0, position - 900),
-      Math.min(decoded.length, position + 900),
-    );
-
-    const titlePatterns = [
-      /"(?:title|subject|articleTitle|article_title)"\s*:\s*"([^"]{4,250})"/i,
-      /<(?:h1|h2|h3|strong|span|p)[^>]*>([^<]{4,250})<\/(?:h1|h2|h3|strong|span|p)>/i,
-      /\[안내\][^"<>{]{3,200}/i,
-    ];
-
-    let title = "";
-    for (const pattern of titlePatterns) {
-      const titleMatch = around.match(pattern);
-      if (titleMatch) {
-        title = titleMatch[1] ?? titleMatch[0];
-        break;
-      }
+    if (posts.length === 0) {
+      // 문제 확인을 위해 렌더링된 페이지 제목과 URL을 로그에 남깁니다.
+      console.log("렌더링된 페이지 제목:", await page.title());
+      console.log("현재 페이지 URL:", page.url());
     }
 
-    addCandidate(candidates, title, url);
+    return posts.slice(0, 30);
+  } finally {
+    await browser.close();
   }
-
-  // articleId와 제목이 같은 JSON 객체 안에 있는 경우를 별도로 처리합니다.
-  const objectRegex =
-    /\{[^{}]{0,1800}?"articleId"\s*:\s*"([a-f0-9]+)"[^{}]{0,1800}?\}/gi;
-
-  for (const objectMatch of decoded.matchAll(objectRegex)) {
-    const block = objectMatch[0];
-    const articleId = objectMatch[1];
-    const titleMatch = block.match(
-      /"(?:title|subject|articleTitle|article_title)"\s*:\s*"([^"]{4,250})"/i,
-    );
-
-    if (titleMatch) {
-      addCandidate(
-        candidates,
-        titleMatch[1],
-        `/ko-kr/board/update/view?articleId=${articleId}`,
-      );
-    }
-  }
-}
-
-function extractUpdatePosts(html) {
-  const $ = cheerio.load(html);
-  const candidates = new Map();
-
-  // 1. 일반 링크
-  $('a[href*="/board/update/view"]').each((_index, element) => {
-    const href = $(element).attr("href");
-    const title =
-      $(element).attr("title") ||
-      $(element).find("[title]").first().attr("title") ||
-      $(element).text();
-
-    addCandidate(candidates, title, href);
-  });
-
-  // 2. JSON-LD
-  $('script[type="application/ld+json"]').each((_index, element) => {
-    try {
-      walkJson(JSON.parse($(element).html() ?? ""), candidates);
-    } catch {
-      // 잘못된 JSON-LD는 건너뜁니다.
-    }
-  });
-
-  // 3. Next.js/React 상태 데이터
-  extractFromJsonScripts($, candidates);
-
-  // 4. HTML 내부 이스케이프 문자열
-  extractFromRawHtml(html, candidates);
-
-  return [...candidates.values()].slice(0, 30);
 }
 
 async function enrichPost(post) {
+  const browser = await launchBrowser();
+
   try {
-    const html = await fetchHtml(post.url);
-    const $ = cheerio.load(html);
+    const page = await browser.newPage({
+      locale: "ko-KR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    });
 
-    const title =
-      cleanText($('meta[property="og:title"]').attr("content")) ||
-      cleanText($("h1").first().text()) ||
-      post.title;
+    await page.goto(post.url, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
+    });
+    await page.waitForTimeout(2000);
 
-    const description =
-      cleanText($('meta[property="og:description"]').attr("content")) ||
-      cleanText($('meta[name="description"]').attr("content")) ||
-      cleanText($("article").first().text()).slice(0, 900);
+    const details = await page.evaluate(() => {
+      const meta = (selector) =>
+        document.querySelector(selector)?.getAttribute("content") || "";
 
-    const image =
-      normalizeUrl($('meta[property="og:image"]').attr("content")) ||
-      normalizeUrl($('meta[name="twitter:image"]').attr("content"));
+      const title =
+        meta('meta[property="og:title"]') ||
+        document.querySelector("h1")?.textContent ||
+        document.title ||
+        "";
 
-    const published =
-      $('meta[property="article:published_time"]').attr("content") ||
-      $("time").first().attr("datetime") ||
-      post.published ||
-      null;
+      const description =
+        meta('meta[property="og:description"]') ||
+        meta('meta[name="description"]') ||
+        document.querySelector("article")?.textContent ||
+        "";
+
+      const image =
+        meta('meta[property="og:image"]') ||
+        meta('meta[name="twitter:image"]') ||
+        "";
+
+      const published =
+        meta('meta[property="article:published_time"]') ||
+        document.querySelector("time")?.getAttribute("datetime") ||
+        "";
+
+      return { title, description, image, published };
+    });
 
     return {
       ...post,
-      title,
-      description: description.slice(0, 900),
-      image,
-      published,
+      title: cleanText(details.title) || post.title,
+      description: cleanText(details.description).slice(0, 900),
+      image: normalizeUrl(details.image),
+      published: details.published || null,
     };
   } catch (error) {
     console.warn("상세 정보 읽기 실패:", post.url, error.message);
@@ -319,8 +190,10 @@ async function enrichPost(post) {
       ...post,
       description: "",
       image: null,
-      published: post.published ?? null,
+      published: null,
     };
+  } finally {
+    await browser.close();
   }
 }
 
@@ -353,9 +226,10 @@ function makeEmbed(post) {
     })
     .setFooter({ text: "AION2 • PLAYNC" });
 
+  if (post.image) embed.setImage(post.image);
+
   const date = post.published ? new Date(post.published) : new Date();
   if (!Number.isNaN(date.getTime())) embed.setTimestamp(date);
-  if (post.image) embed.setImage(post.image);
 
   return embed;
 }
@@ -392,21 +266,18 @@ async function checkUpdates() {
       );
     }
 
-    const html = await fetchHtml(UPDATE_LIST_URL);
-    const posts = extractUpdatePosts(html);
-
+    const posts = await getUpdatePosts();
     console.log(`업데이트 게시글 후보 ${posts.length}개 발견`);
 
     if (posts.length === 0) {
       throw new Error(
-        "업데이트 게시글을 찾지 못했습니다. 공식 홈페이지 응답 구조를 다시 확인해야 합니다.",
+        "브라우저로 페이지를 열었지만 업데이트 게시글을 찾지 못했습니다.",
       );
     }
 
     const postedUrls = await getAlreadyPostedUrls(channel);
     const newPosts = posts.filter((post) => !postedUrls.has(post.url));
 
-    // 최초 실행 시 기존 글이 여러 개 올라오는 것을 막고 최신 후보 1개만 보냅니다.
     const targets = firstSuccessfulCheck
       ? newPosts.slice(0, 1)
       : newPosts.slice(0, 5).reverse();
