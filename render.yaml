@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: aion2-patch-discord-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_ID
+        sync: false
+      - key: CHECK_INTERVAL_MINUTES
+        value: 10
