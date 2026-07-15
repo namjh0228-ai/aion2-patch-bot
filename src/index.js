@@ -36,13 +36,36 @@ app.listen(process.env.PORT || 3000, () => {
 
 function normalizeUrl(value) {
   if (!value) return null;
+
   try {
-    return new URL(value, UPDATE_LIST_URL).toString();
+    const url = new URL(value, UPDATE_LIST_URL);
+
+    url.hash = "";
+
+    return url.toString();
   } catch {
     return null;
   }
-}
+function getPostKey(value) {
+  const normalized = normalizeUrl(value);
+  if (!normalized) return null;
 
+  try {
+    const url = new URL(normalized);
+    const articleId = url.searchParams.get("articleId");
+
+    if (articleId) {
+      return `articleId:${articleId}`;
+    }
+
+    url.hash = "";
+    url.searchParams.sort();
+
+    return url.toString();
+  } catch {
+    return normalized;
+  }
+}
 function cleanText(value) {
   return String(value ?? "")
     .replace(/\s+/g, " ")
@@ -198,16 +221,25 @@ async function enrichPost(post) {
 }
 
 async function getAlreadyPostedUrls(channel) {
-  const messages = await channel.messages.fetch({ limit: 100 });
-  const urls = new Set();
+  const messages = await channel.messages.fetch({
+    limit: 100,
+    cache: false,
+  });
+
+  const postedKeys = new Set();
 
   for (const message of messages.values()) {
     for (const embed of message.embeds) {
-      if (embed.url) urls.add(embed.url);
+      const key = getPostKey(embed.url);
+
+      if (key) {
+        postedKeys.add(key);
+      }
     }
   }
 
-  return urls;
+  return postedKeys;
+}
 }
 
 function makeEmbed(post) {
@@ -282,11 +314,28 @@ async function checkUpdates() {
       ? newPosts.slice(0, 1)
       : newPosts.slice(0, 5).reverse();
 
-    for (const post of targets) {
-      const enriched = await enrichPost(post);
-      await channel.send({ embeds: [makeEmbed(enriched)] });
-      console.log("게시 완료:", enriched.title);
-    }
+   for (const post of targets) {
+  const postKey = getPostKey(post.url);
+
+  // 배포 과정에서 다른 봇 프로세스가 먼저 게시했는지 다시 확인
+  const latestPostedKeys = await getAlreadyPostedUrls(channel);
+
+  if (postKey && latestPostedKeys.has(postKey)) {
+    console.log("중복 게시 생략:", post.title);
+    continue;
+  }
+
+  const enriched = await enrichPost(post);
+
+  await channel.send({
+    embeds: [makeEmbed(enriched)],
+  });
+
+  console.log("게시 완료:", enriched.title);
+
+  // 연속 처리 중 같은 글이 다시 선택되는 것도 방지
+  postedKeys.add(postKey);
+}
 
     firstSuccessfulCheck = false;
     console.log(
