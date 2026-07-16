@@ -12,13 +12,16 @@ const UPDATE_LIST_URL =
 
 const token = process.env.DISCORD_TOKEN;
 const channelId = process.env.DISCORD_CHANNEL_ID;
+
 const intervalMinutes = Math.max(
   10,
   Number.parseInt(process.env.CHECK_INTERVAL_MINUTES ?? "10", 10) || 10,
 );
 
 if (!token || !channelId) {
-  console.error("필수 환경변수가 없습니다: DISCORD_TOKEN, DISCORD_CHANNEL_ID");
+  console.error(
+    "필수 환경변수가 없습니다: DISCORD_TOKEN, DISCORD_CHANNEL_ID",
+  );
   process.exit(1);
 }
 
@@ -26,50 +29,78 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
+/* Render Web Service용 상태 확인 서버 */
 const app = express();
+
 app.get("/", (_req, res) => {
   res.status(200).send("AION2 patch bot is running.");
 });
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Health server started.");
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    botReady: client.isReady(),
+    checkedAt: new Date().toISOString(),
+  });
 });
+
+const port = Number.parseInt(process.env.PORT ?? "3000", 10);
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Health server started on port ${port}.`);
+});
+
+function cleanText(value) {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function normalizeUrl(value) {
   if (!value) return null;
 
   try {
     const url = new URL(value, UPDATE_LIST_URL);
-
     url.hash = "";
 
+    /* 추적용 파라미터는 중복 판정에서 제외 */
+    for (const key of [...url.searchParams.keys()]) {
+      if (
+        key.toLowerCase().startsWith("utm_") ||
+        ["ref", "source", "from"].includes(key.toLowerCase())
+      ) {
+        url.searchParams.delete(key);
+      }
+    }
+
+    url.searchParams.sort();
     return url.toString();
   } catch {
     return null;
   }
+}
+
 function getPostKey(value) {
   const normalized = normalizeUrl(value);
   if (!normalized) return null;
 
   try {
     const url = new URL(normalized);
-    const articleId = url.searchParams.get("articleId");
+
+    /* AION2 게시글의 고유 번호를 최우선으로 사용 */
+    const articleId =
+      url.searchParams.get("articleId") ||
+      url.searchParams.get("articleid") ||
+      url.searchParams.get("id");
 
     if (articleId) {
-      return `articleId:${articleId}`;
+      return `article:${articleId}`;
     }
 
-    url.hash = "";
-    url.searchParams.sort();
-
-    return url.toString();
+    /* articleId가 없을 때도 동일 주소를 안정적으로 비교 */
+    return `${url.origin}${url.pathname}?${url.searchParams.toString()}`;
   } catch {
     return normalized;
   }
-}
-function cleanText(value) {
-  return String(value ?? "")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 async function launchBrowser() {
@@ -79,6 +110,7 @@ async function launchBrowser() {
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
+      "--disable-gpu",
     ],
   });
 }
@@ -97,17 +129,18 @@ async function getUpdatePosts() {
 
     await page.goto(UPDATE_LIST_URL, {
       waitUntil: "domcontentloaded",
-      timeout: 60000,
+      timeout: 60_000,
     });
 
-    // 게시판 데이터가 자바스크립트로 불러와질 시간을 줍니다.
     await page
-      .waitForSelector('a[href*="/board/update/view"]', { timeout: 30000 })
+      .waitForSelector('a[href*="/board/update/view"]', {
+        timeout: 30_000,
+      })
       .catch(() => null);
 
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(3_000);
 
-    const posts = await page.evaluate(() => {
+    const rawPosts = await page.evaluate(() => {
       const results = [];
       const seen = new Set();
 
@@ -126,7 +159,7 @@ async function getUpdatePosts() {
         if (
           !href ||
           !href.includes("articleId=") ||
-          cleanedTitle.length < 4 ||
+          cleanedTitle.length < 2 ||
           seen.has(href)
         ) {
           continue;
@@ -142,13 +175,24 @@ async function getUpdatePosts() {
       return results;
     });
 
-    if (posts.length === 0) {
-      // 문제 확인을 위해 렌더링된 페이지 제목과 URL을 로그에 남깁니다.
-      console.log("렌더링된 페이지 제목:", await page.title());
-      console.log("현재 페이지 URL:", page.url());
+    const deduped = [];
+    const seenKeys = new Set();
+
+    for (const post of rawPosts) {
+      const url = normalizeUrl(post.url);
+      const key = getPostKey(url);
+
+      if (!url || !key || seenKeys.has(key)) continue;
+
+      seenKeys.add(key);
+      deduped.push({
+        title: cleanText(post.title),
+        url,
+      });
     }
 
-    return posts.slice(0, 30);
+    console.log(`업데이트 게시글 후보 ${deduped.length}개 발견`);
+    return deduped.slice(0, 30);
   } finally {
     await browser.close();
   }
@@ -167,37 +211,35 @@ async function enrichPost(post) {
 
     await page.goto(post.url, {
       waitUntil: "domcontentloaded",
-      timeout: 60000,
+      timeout: 60_000,
     });
-    await page.waitForTimeout(2000);
+
+    await page.waitForTimeout(2_000);
 
     const details = await page.evaluate(() => {
       const meta = (selector) =>
         document.querySelector(selector)?.getAttribute("content") || "";
 
-      const title =
-        meta('meta[property="og:title"]') ||
-        document.querySelector("h1")?.textContent ||
-        document.title ||
-        "";
-
-      const description =
-        meta('meta[property="og:description"]') ||
-        meta('meta[name="description"]') ||
-        document.querySelector("article")?.textContent ||
-        "";
-
-      const image =
-        meta('meta[property="og:image"]') ||
-        meta('meta[name="twitter:image"]') ||
-        "";
-
-      const published =
-        meta('meta[property="article:published_time"]') ||
-        document.querySelector("time")?.getAttribute("datetime") ||
-        "";
-
-      return { title, description, image, published };
+      return {
+        title:
+          meta('meta[property="og:title"]') ||
+          document.querySelector("h1")?.textContent ||
+          document.title ||
+          "",
+        description:
+          meta('meta[property="og:description"]') ||
+          meta('meta[name="description"]') ||
+          document.querySelector("article")?.textContent ||
+          "",
+        image:
+          meta('meta[property="og:image"]') ||
+          meta('meta[name="twitter:image"]') ||
+          "",
+        published:
+          meta('meta[property="article:published_time"]') ||
+          document.querySelector("time")?.getAttribute("datetime") ||
+          "",
+      };
     });
 
     return {
@@ -209,6 +251,7 @@ async function enrichPost(post) {
     };
   } catch (error) {
     console.warn("상세 정보 읽기 실패:", post.url, error.message);
+
     return {
       ...post,
       description: "",
@@ -220,26 +263,39 @@ async function enrichPost(post) {
   }
 }
 
-async function getAlreadyPostedUrls(channel) {
-  const messages = await channel.messages.fetch({
-    limit: 100,
-    cache: false,
-  });
-
+async function getAlreadyPostedKeys(channel) {
   const postedKeys = new Set();
 
-  for (const message of messages.values()) {
-    for (const embed of message.embeds) {
-      const key = getPostKey(embed.url);
+  /*
+   * 최근 100개만 보는 대신 최대 500개까지 확인합니다.
+   * Discord API 호출량을 줄이기 위해 한 번의 확인 주기에서만 실행됩니다.
+   */
+  let before;
+  let fetchedCount = 0;
 
-      if (key) {
-        postedKeys.add(key);
+  while (fetchedCount < 500) {
+    const messages = await channel.messages.fetch({
+      limit: 100,
+      before,
+      cache: false,
+    });
+
+    if (messages.size === 0) break;
+
+    for (const message of messages.values()) {
+      for (const embed of message.embeds) {
+        const key = getPostKey(embed.url);
+        if (key) postedKeys.add(key);
       }
     }
+
+    fetchedCount += messages.size;
+    before = messages.last()?.id;
+
+    if (messages.size < 100) break;
   }
 
   return postedKeys;
-}
 }
 
 function makeEmbed(post) {
@@ -256,12 +312,20 @@ function makeEmbed(post) {
       name: "🔗 원문 보기",
       value: `[아이온2 공식 홈페이지에서 확인하기](${post.url})`,
     })
-    .setFooter({ text: "AION2 • PLAYNC" });
+    .setFooter({
+      text: `AION2 · PLAYNC · ${getPostKey(post.url) ?? "update"}`,
+    });
 
-  if (post.image) embed.setImage(post.image);
+  if (post.image) {
+    embed.setImage(post.image);
+  }
 
-  const date = post.published ? new Date(post.published) : new Date();
-  if (!Number.isNaN(date.getTime())) embed.setTimestamp(date);
+  if (post.published) {
+    const date = new Date(post.published);
+    if (!Number.isNaN(date.getTime())) {
+      embed.setTimestamp(date);
+    }
+  }
 
   return embed;
 }
@@ -270,7 +334,11 @@ let checking = false;
 let firstSuccessfulCheck = true;
 
 async function checkUpdates() {
-  if (checking) return;
+  if (checking) {
+    console.log("이전 확인 작업이 진행 중이므로 이번 실행은 생략합니다.");
+    return;
+  }
+
   checking = true;
 
   try {
@@ -299,47 +367,71 @@ async function checkUpdates() {
     }
 
     const posts = await getUpdatePosts();
-    console.log(`업데이트 게시글 후보 ${posts.length}개 발견`);
-
     if (posts.length === 0) {
       throw new Error(
         "브라우저로 페이지를 열었지만 업데이트 게시글을 찾지 못했습니다.",
       );
     }
 
-    const postedUrls = await getAlreadyPostedUrls(channel);
-    const newPosts = posts.filter((post) => !postedUrls.has(post.url));
+    const postedKeys = await getAlreadyPostedKeys(channel);
 
+    const newPosts = posts.filter((post) => {
+      const key = getPostKey(post.url);
+      return key && !postedKeys.has(key);
+    });
+
+    /*
+     * 첫 정상 실행에서는 최신 글 한 개만 게시합니다.
+     * 이후에는 누락 방지를 위해 새 글을 오래된 순서로 최대 5개 게시합니다.
+     */
     const targets = firstSuccessfulCheck
       ? newPosts.slice(0, 1)
       : newPosts.slice(0, 5).reverse();
 
-   for (const post of targets) {
-  const postKey = getPostKey(post.url);
+    let sentCount = 0;
 
-  // 배포 과정에서 다른 봇 프로세스가 먼저 게시했는지 다시 확인
-  const latestPostedKeys = await getAlreadyPostedUrls(channel);
+    for (const post of targets) {
+      const postKey = getPostKey(post.url);
+      if (!postKey || postedKeys.has(postKey)) continue;
 
-  if (postKey && latestPostedKeys.has(postKey)) {
-    console.log("중복 게시 생략:", post.title);
-    continue;
-  }
+      /*
+       * 배포가 겹치는 짧은 구간에도 중복을 줄이기 위해
+       * 전송 직전에 최신 메시지를 한 번 더 확인합니다.
+       */
+      const latestMessages = await channel.messages.fetch({
+        limit: 20,
+        cache: false,
+      });
 
-  const enriched = await enrichPost(post);
+      const latestKeys = new Set();
+      for (const message of latestMessages.values()) {
+        for (const embed of message.embeds) {
+          const key = getPostKey(embed.url);
+          if (key) latestKeys.add(key);
+        }
+      }
 
-  await channel.send({
-    embeds: [makeEmbed(enriched)],
-  });
+      if (latestKeys.has(postKey)) {
+        console.log("중복 게시 생략:", post.title);
+        postedKeys.add(postKey);
+        continue;
+      }
 
-  console.log("게시 완료:", enriched.title);
+      const enriched = await enrichPost(post);
 
-  // 연속 처리 중 같은 글이 다시 선택되는 것도 방지
-  postedKeys.add(postKey);
-}
+      await channel.send({
+        embeds: [makeEmbed(enriched)],
+      });
+
+      postedKeys.add(postKey);
+      sentCount += 1;
+      console.log("게시 완료:", enriched.title);
+    }
 
     firstSuccessfulCheck = false;
+
     console.log(
-      `[${new Date().toISOString()}] 확인 완료. 새 글 ${targets.length}개`,
+      `[${new Date().toISOString()}] 확인 완료. 새 글 ${sentCount}개`,
     );
   } catch (error) {
     console.error("업데이트 확인 실패:", error);
@@ -350,8 +442,12 @@ async function checkUpdates() {
 
 client.once("clientReady", async () => {
   console.log(`${client.user.tag} 로그인 완료`);
+
   await checkUpdates();
-  setInterval(checkUpdates, intervalMinutes * 60 * 1000);
+
+  setInterval(() => {
+    void checkUpdates();
+  }, intervalMinutes * 60 * 1000);
 });
 
 client.login(token);
