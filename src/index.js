@@ -392,6 +392,12 @@ async function checkUpdates() {
 
     for (const post of targets) {
       const postKey = getPostKey(post.url);
+
+      console.log("게시 후보:", {
+  title: post.title,
+  url: post.url,
+  key: postKey,
+});
       if (!postKey || postedKeys.has(postKey)) continue;
 
       /*
