@@ -1,0 +1,17 @@
+name: Keep Render Bot Awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping Render health endpoint
+        run: |
+          curl --fail --silent --show-error \
+            --max-time 120 \
+            https://aion2-patch-bot.onrender.com/health
