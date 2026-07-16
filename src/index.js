@@ -331,7 +331,6 @@ function makeEmbed(post) {
 }
 
 let checking = false;
-let firstSuccessfulCheck = true;
 
 async function checkUpdates() {
   if (checking) {
@@ -375,29 +374,21 @@ async function checkUpdates() {
 
     const postedKeys = await getAlreadyPostedKeys(channel);
 
-    const newPosts = posts.filter((post) => {
-      const key = getPostKey(post.url);
-      return key && !postedKeys.has(key);
-    });
-
     /*
-     * 첫 정상 실행에서는 최신 글 한 개만 게시합니다.
-     * 이후에는 누락 방지를 위해 새 글을 오래된 순서로 최대 5개 게시합니다.
+     * 게시판 최상단의 최신 글 한 개만 확인합니다.
+     * 과거 글이 디스코드에 없더라도 소급해서 올리지 않습니다.
      */
-    const targets = firstSuccessfulCheck
-      ? newPosts.slice(0, 1)
-      : newPosts.slice(0, 5).reverse();
+    const latestPost = posts[0];
+    const latestKey = getPostKey(latestPost?.url);
+    const targets =
+      latestPost && latestKey && !postedKeys.has(latestKey)
+        ? [latestPost]
+        : [];
 
     let sentCount = 0;
 
     for (const post of targets) {
       const postKey = getPostKey(post.url);
-
-      console.log("게시 후보:", {
-  title: post.title,
-  url: post.url,
-  key: postKey,
-});
       if (!postKey || postedKeys.has(postKey)) continue;
 
       /*
@@ -434,7 +425,6 @@ async function checkUpdates() {
       console.log("게시 완료:", enriched.title);
     }
 
-    firstSuccessfulCheck = false;
 
     console.log(
       `[${new Date().toISOString()}] 확인 완료. 새 글 ${sentCount}개`,
